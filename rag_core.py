@@ -32,7 +32,9 @@ class Config:
     chunk_overlap: int = 20           # word overlap between chunks (fixed mode only)
     title_prefix: bool = True         # prepend doc title to each chunk's embedded text
     drop_boilerplate: bool = True     # remove the repeated disclaimer line
-    embedder: str = "minilm"          # minilm | tfidf | tfidf_char
+    embedder: str = "openai"          # openai | minilm | tfidf | tfidf_char
+    embed_model: str = "text-embedding-3-small"   # OpenAI embedding model
+    chat_model: str = "gpt-4o-mini"               # OpenAI model that writes the answer
     mode: str = "hybrid"              # dense | bm25 | hybrid
     dense_weight: float = 0.6         # dense vs BM25 weight when mode="hybrid"
     top_k: int = 5                    # how many chunks to retrieve
@@ -195,8 +197,40 @@ class TfidfSVD:
         return _norm(self.svd.transform(self.vec.transform(list(texts))))
 
 
-def get_embedder(name: str):
-    """Factory. MiniLM falls back to TF-IDF if the model can't be downloaded."""
+class OpenAIEmbedder:
+    """Dense embeddings via the OpenAI API (text-embedding-3-small, 1536-d).
+
+    Needs OPENAI_API_KEY in the environment. The API client is not picklable,
+    so only the model name is persisted; the client is rebuilt lazily on use.
+    """
+    name = "openai"
+    def __init__(self, model="text-embedding-3-small", api_key=None):
+        self.model = model; self.dim = 1536
+        self._api_key = api_key; self._client = None
+    @property
+    def client(self):
+        if self._client is None:
+            from openai import OpenAI
+            self._client = OpenAI(api_key=self._api_key or os.getenv("OPENAI_API_KEY"))
+        return self._client
+    def fit(self, corpus): return self          # no training step; uniform interface
+    def encode(self, texts):
+        texts = list(texts)
+        # OpenAI allows up to 2048 inputs per request; batch to stay safe.
+        out = []
+        for i in range(0, len(texts), 1000):
+            resp = self.client.embeddings.create(model=self.model, input=texts[i:i + 1000])
+            out.extend(d.embedding for d in resp.data)
+        return _norm(np.array(out, dtype="float32"))
+    # Persist only model + dim; never the client or the key.
+    def __getstate__(self): return {"model": self.model, "dim": self.dim}
+    def __setstate__(self, s):
+        self.model = s["model"]; self.dim = s["dim"]; self._api_key = None; self._client = None
+
+
+def get_embedder(name: str, embed_model: str = "text-embedding-3-small", api_key: str | None = None):
+    """Factory. `openai` is the default; the others are local alternatives/fallbacks."""
+    if name == "openai": return OpenAIEmbedder(embed_model, api_key)
     if name == "minilm":
         try: return MiniLM()
         except Exception as e:
@@ -241,15 +275,16 @@ class Index:
                    s["bm25"], s["embedder"])
 
 
-def build_index(cfg: Config | None = None, pdf_dir="pdfs") -> Index:
-    """Full build: load -> chunk -> embed -> FAISS (dense) + BM25 (sparse)."""
+def build_index(cfg: Config | None = None, pdf_dir="pdfs", api_key: str | None = None) -> Index:
+    """Full build: load -> chunk -> embed -> FAISS (dense) + BM25 (sparse).
+    api_key is only needed when embedder='openai' (read from env otherwise)."""
     import faiss
     from rank_bm25 import BM25Okapi
     cfg = cfg or Config()
     chunks = chunk_pages(load_pages(pdf_dir), cfg)
     if not chunks: raise RuntimeError("Chunking produced no chunks.")
     corpus = [c.embed_text for c in chunks]
-    emb = get_embedder(cfg.embedder); emb.fit(corpus)     # fit is a no-op for MiniLM
+    emb = get_embedder(cfg.embedder, cfg.embed_model, api_key); emb.fit(corpus)   # fit no-op for openai/minilm
     vecs = emb.encode(corpus)
     # IndexFlatIP = exact inner-product search; on normalised vectors that's cosine.
     fi = faiss.IndexFlatIP(vecs.shape[1]); fi.add(np.ascontiguousarray(vecs))
@@ -341,13 +376,23 @@ Decision = Literal["answer", "clarify", "refuse"]
 REFUSAL = ("I don't have enough evidence in these documents to answer that. "
            "The closest material found is shown in the trace below.")
 
+# Instruction for the LLM: summarise the retrieved passages into a grounded,
+# cited answer. It must not use outside knowledge.
+SYSTEM_PROMPT = (
+    "You answer questions using ONLY the numbered context passages provided.\n"
+    "- Summarise the relevant passages into a clear answer in your own words.\n"
+    "- Use only the context; never add outside knowledge.\n"
+    "- Cite every claim inline as [filename:page], copied exactly from the passage header.\n"
+    "- If the context does not contain the answer, say so plainly. Do not guess.\n"
+    "- Keep it to 1-3 sentences.")
+
 
 @dataclass
 class Answer:
     """Final response: the text, the gate decision, citations, and its trace."""
     text: str; decision: Decision
     citations: list[str] = field(default_factory=list)
-    trace: Trace | None = None; generator: str = "extractive"
+    trace: Trace | None = None; generator: str = "openai"
     def to_dict(self):
         return {"answer": self.text, "decision": self.decision, "citations": self.citations,
                 "generator": self.generator, "trace": self.trace.to_dict() if self.trace else None}
@@ -363,17 +408,27 @@ def gate(trace: Trace, cfg: Config) -> Decision:
     return "answer"
 
 
-def _extractive(trace: Trace, n=1):
-    """Build an answer from the top n chunks verbatim, with de-duplicated citations."""
-    parts, cites, seen = [], [], set()
-    for h in trace.hits[:n]:
-        parts.append(f"{h.text.rstrip('.')}. {h.citation()}")
-        if h.citation() not in seen: seen.add(h.citation()); cites.append(h.citation())
-    return " ".join(parts), cites
+def _llm_summary(query: str, trace: Trace, model: str, api_key: str | None):
+    """Ask the OpenAI chat model to summarise the retrieved chunks into an answer."""
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+    context = "\n\n".join(f"[{h.source}:{h.page}] {h.text}" for h in trace.hits)
+    resp = client.chat.completions.create(
+        model=model, temperature=0, max_tokens=300,
+        messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                  {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}])
+    text = resp.choices[0].message.content.strip()
+    # Collect the citations the model actually used, in order, de-duplicated.
+    cites, seen = [], set()
+    for h in trace.hits:
+        c = h.citation()
+        if c in text and c not in seen: seen.add(c); cites.append(c)
+    return text, cites
 
 
-def answer_question(index: Index, query: str, cfg: Config | None = None, **kw) -> Answer:
-    """Top-level entry point: retrieve -> gate -> answer/clarify/refuse, all cited."""
+def answer_question(index: Index, query: str, cfg: Config | None = None,
+                    api_key: str | None = None, **kw) -> Answer:
+    """Top-level entry point: retrieve -> gate -> summarise with OpenAI (or refuse/clarify)."""
     cfg = cfg or index.cfg
     trace = search(index, query, top_k=kw.pop("top_k", cfg.top_k),
                    mode=kw.pop("mode", cfg.mode), **kw)
@@ -385,5 +440,6 @@ def answer_question(index: Index, query: str, cfg: Config | None = None, **kw) -
         return Answer(f"That could refer to either {a.source} or {b.source} — they scored "
                       f"almost identically (gap {trace.margin:.3f}). Which did you mean?",
                       d, [], trace, "gate")
-    t, c = _extractive(trace)                 # confident enough -> quote the evidence
-    return Answer(t, "answer", c, trace, "extractive")
+    # Confident enough -> summarise the retrieved evidence with the LLM.
+    text, cites = _llm_summary(query, trace, cfg.chat_model, api_key)
+    return Answer(text, "answer", cites, trace, f"openai:{cfg.chat_model}")

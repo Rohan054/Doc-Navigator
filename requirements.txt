@@ -1,0 +1,12 @@
+# CPU-only torch keeps the Streamlit Cloud build small (no CUDA wheels).
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+pypdf>=5.1,<6
+numpy>=1.26,<3
+pandas>=2.2,<4
+scikit-learn>=1.4,<2
+faiss-cpu>=1.8,<2
+rank-bm25==0.2.2
+sentence-transformers>=3.0,<6
+torch>=2.2
+streamlit>=1.36,<2

@@ -17,7 +17,8 @@ import numpy as np
 
 # Identical disclaimer line in every sample PDF -> pure index noise, dropped at chunk time.
 BOILERPLATE = re.compile(r"this pdf is synthetic and intended for", re.I)
-NUMBERED = re.compile(r"^\s*\d+[.)]\s+")   # "1. " / "2) " list markers -> statement boundaries
+NUMBERED = re.compile(r"^\s*\d+[.)]\s+")   # "1. " / "2) " list markers (fixed/legacy use)
+SENTENCE = re.compile(r"(?<=[.!?])\s+")    # split after . ! ? followed by whitespace
 TOKEN = re.compile(r"[a-z0-9]+")           # BM25 tokenizer pattern
 
 
@@ -26,7 +27,7 @@ TOKEN = re.compile(r"[a-z0-9]+")           # BM25 tokenizer pattern
 class Config:
     """Every tunable in one place. Copy + tweak fields to run an experiment."""
     name: str = "default"
-    chunk_mode: str = "statement"     # statement | fixed | whole
+    chunk_mode: str = "sentence"      # sentence | fixed | whole
     chunk_size: int = 100             # words per chunk (fixed mode only)
     chunk_overlap: int = 20           # word overlap between chunks (fixed mode only)
     title_prefix: bool = True         # prepend doc title to each chunk's embedded text
@@ -108,19 +109,12 @@ def _segments(pg: Page, cfg: Config) -> list[str]:
         out = [" ".join(words[i:i + cfg.chunk_size]) for i in range(0, len(words), step)]
         return [s for s in out if len(s.split()) > 5]
 
-    if cfg.chunk_mode == "statement":     # one chunk per numbered statement (default)
-        segs, buf = [], []
-        for l in lines:
-            if l == pg.title:             # don't turn the title itself into a chunk
-                continue
-            if NUMBERED.match(l):         # new numbered item -> flush the previous one
-                if buf: segs.append(" ".join(buf))
-                buf = [NUMBERED.sub("", l)]
-            elif buf: buf.append(l)       # continuation line of the current statement
-            else: segs.append(l)          # prose before any numbering
-        if buf: segs.append(" ".join(buf))
-        segs = [s.strip() for s in segs if len(s.split()) >= 4]   # drop tiny fragments
-        # Real-world PDFs have long paragraphs; split anything over ~220 words.
+    if cfg.chunk_mode == "sentence":      # one chunk per sentence (default)
+        body = [l for l in lines if l != pg.title]        # drop the title line
+        text = " ".join(body)
+        segs = SENTENCE.split(text)                       # split . ! ? -> sentences
+        segs = [s.strip() for s in segs if len(s.split()) >= 3]   # drop tiny fragments
+        # Real-world PDFs can have very long sentences; cap at ~220 words.
         out = []
         for s in segs:
             w = s.split()
@@ -369,7 +363,7 @@ def gate(trace: Trace, cfg: Config) -> Decision:
     return "answer"
 
 
-def _extractive(trace: Trace, n=2):
+def _extractive(trace: Trace, n=1):
     """Build an answer from the top n chunks verbatim, with de-duplicated citations."""
     parts, cites, seen = [], [], set()
     for h in trace.hits[:n]:

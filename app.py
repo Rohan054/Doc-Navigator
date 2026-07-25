@@ -21,11 +21,12 @@ BADGE = {"answer":  ("Answered", "#1a7f37", "Evidence cleared the confidence thr
 PDF_DIR = Path("pdfs")
 
 
-# Cache the built index so it is not rebuilt on every interaction; the `stamp`
-# arg is part of the cache key, so changing PDFs or settings forces a rebuild.
+# Fixed pipeline: MiniLM embeddings, sentence chunking, title prefix, hybrid retrieval.
+# Cache the built index; the `stamp` arg is part of the cache key, so changing PDFs
+# forces a rebuild.
 @st.cache_resource(show_spinner="Building index...")
-def build(pdf_dir: str, embedder: str, chunk_mode: str, title_prefix: bool, stamp: str):
-    cfg = rc.Config(embedder=embedder, chunk_mode=chunk_mode, title_prefix=title_prefix)
+def build(pdf_dir: str, stamp: str):
+    cfg = rc.Config(embedder="minilm", chunk_mode="sentence", title_prefix=True)
     return rc.build_index(cfg, pdf_dir)
 
 
@@ -36,10 +37,10 @@ st.caption("A RAG assistant that shows *why* it answered: retrieval traces, cita
 with st.sidebar:
     # --- Document source: upload PDFs, or use any bundled in pdfs/ ---
     st.header("Documents")
-    uploaded = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
+    uploaded = st.file_uploader("Select PDFs", type="pdf", accept_multiple_files=True)
     if uploaded:
         tmp = Path(tempfile.gettempdir()) / "docnav_pdfs"
-        if st.button("Index uploaded PDFs", type="primary"):
+        if st.button("Upload PDFs", type="primary"):
             shutil.rmtree(tmp, ignore_errors=True); tmp.mkdir(parents=True)
             for f in uploaded:
                 (tmp / f.name).write_bytes(f.getbuffer())
@@ -52,14 +53,8 @@ with st.sidebar:
             st.session_state["stamp"] = "bundled"
             st.cache_resource.clear()
 
-    # --- Live retrieval controls; every widget feeds the Config below ---
+    # --- Retrieval controls (pipeline is fixed to MiniLM + sentence + hybrid) ---
     st.header("Retrieval")
-    embedder = st.selectbox("Embedder", ["minilm", "tfidf", "tfidf_char"], 0)
-    chunk_mode = st.selectbox("Chunking", ["statement", "fixed", "whole"], 0,
-                              help="Whole-document chunking caps precision@5 at 1/k.")
-    title_prefix = st.checkbox("Prefix chunks with document title", True)
-    mode = st.radio("Mode", ["hybrid", "dense", "bm25"], 0, horizontal=True)
-    dense_weight = st.slider("Dense weight", 0.0, 1.0, 0.6, 0.05, disabled=(mode != "hybrid"))
     top_k = st.slider("top-k", 1, 10, 5)
 
     # --- Thresholds for the refuse / clarify logic ---
@@ -73,19 +68,18 @@ if not pdf_dir:
     if PDF_DIR.exists() and any(PDF_DIR.glob("*.pdf")):
         pdf_dir, st.session_state["stamp"] = str(PDF_DIR), "bundled"
     else:
-        st.info("Upload PDFs in the sidebar, then press **Index uploaded PDFs**.")
+        st.info("Select PDFs in the sidebar, then press **Upload PDFs**.")
         st.stop()
 
 try:
-    index = build(pdf_dir, embedder, chunk_mode, title_prefix,
-                  st.session_state.get("stamp", "bundled"))
+    index = build(pdf_dir, st.session_state.get("stamp", "bundled"))
 except Exception as exc:
     st.error(f"Could not build the index: {exc}")
     st.stop()
 
-# Rebuild a Config from the live sidebar widgets for this query.
-cfg = rc.Config(embedder=embedder, chunk_mode=chunk_mode, title_prefix=title_prefix,
-                mode=mode, dense_weight=dense_weight, top_k=top_k,
+# Fixed pipeline config, plus the live retrieval/gate sliders for this query.
+cfg = rc.Config(embedder="minilm", chunk_mode="sentence", title_prefix=True,
+                mode="hybrid", dense_weight=0.6, top_k=top_k,
                 refuse_below=refuse_below, clarify_margin=clarify_margin)
 
 # Corpus summary metrics.
@@ -100,8 +94,8 @@ query = st.text_input("Ask a question", placeholder="e.g. What is the return win
 
 if query:
     # Retrieve, gate, and answer in one call; res carries the full trace.
-    res = rc.answer_question(index, query, cfg, mode=mode, top_k=top_k,
-                             dense_weight=dense_weight)
+    res = rc.answer_question(index, query, cfg, mode="hybrid", top_k=top_k,
+                             dense_weight=0.6)
     tr = res.trace
     label, colour, hint = BADGE[res.decision]
     st.markdown(
@@ -127,5 +121,3 @@ if query:
             st.markdown(f"**{h.rank}. `{h.chunk_id}`** - fused `{h.fused_score:.3f}` / "
                         f"cosine `{h.dense_score:.3f}` / bm25 `{h.bm25_score:.2f}`")
             st.write(h.text); st.divider()
-    with st.expander("Trace as JSON"):
-        st.json(res.to_dict())

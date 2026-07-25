@@ -1,9 +1,4 @@
-"""Document Navigator - Streamlit demo (OpenAI-powered).
 
-Needs an OpenAI API key (OPENAI_API_KEY) for both embeddings and answers.
-Deploy: push app.py + rag_core.py + requirements.txt (+ optional pdfs/) to GitHub,
-then share.streamlit.io -> New app -> main file app.py -> Secrets: OPENAI_API_KEY.
-"""
 import os, shutil, tempfile
 from pathlib import Path
 
@@ -23,24 +18,21 @@ PDF_DIR = Path("pdfs")
 
 
 def get_api_key():
-    """Prefer Streamlit Secrets, fall back to the environment variable."""
     try: return st.secrets["OPENAI_API_KEY"]
     except Exception: return os.getenv("OPENAI_API_KEY")
 
 
-# Key required: OpenAI powers both embeddings and answers. Publish it to the env
-# so rag_core's OpenAI client picks it up everywhere.
 API_KEY = get_api_key()
 if API_KEY:
     os.environ["OPENAI_API_KEY"] = API_KEY
 
 
-# Fixed pipeline: OpenAI text-embedding-3-small, sentence chunking, title prefix, hybrid.
-# Cache the built index; the `stamp` arg is part of the cache key, so changing PDFs
-# forces a rebuild.
+
 @st.cache_resource(show_spinner="Building index (embedding with OpenAI)...")
-def build(pdf_dir: str, stamp: str):
-    cfg = rc.Config(embedder="openai", chunk_mode="sentence", title_prefix=True)
+def build(pdf_dir: str, stamp: str, chunk_mode: str, chunk_size: int, chunk_overlap: int):
+    # chunk_mode/size/overlap are part of the cache key, so changing them rebuilds.
+    cfg = rc.Config(embedder="openai", chunk_mode=chunk_mode, title_prefix=True,
+                    chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return rc.build_index(cfg, pdf_dir)
 
 
@@ -48,7 +40,7 @@ st.title("Document Navigator")
 st.caption("A RAG assistant that shows *why* it answered: retrieval traces, citations, "
            "and an explicit confidence gate. Powered by OpenAI.")
 
-# OpenAI key is mandatory (embeddings + answers). Stop early with a clear message.
+
 if not API_KEY:
     st.error("This app needs an OpenAI API key. Add **OPENAI_API_KEY** in "
              "Streamlit **Settings → Secrets** (or set it as an environment variable "
@@ -56,7 +48,7 @@ if not API_KEY:
     st.stop()
 
 with st.sidebar:
-    # --- Document source: upload PDFs, or use any bundled in pdfs/ ---
+    # Document source: upload PDFs, or use any bundled in pdfs
     st.header("Documents")
     uploaded = st.file_uploader("Select PDFs", type="pdf", accept_multiple_files=True)
     if uploaded:
@@ -74,11 +66,22 @@ with st.sidebar:
             st.session_state["stamp"] = "bundled"
             st.cache_resource.clear()
 
-    # --- Retrieval controls (pipeline is fixed to MiniLM + sentence + hybrid) ---
+    # Chunking: sentence for small/clean docs, recursive for larger PDFs
+    st.header("Chunking")
+    chunk_mode = st.selectbox("Method", ["sentence", "recursive"], 0,
+        help="sentence: one chunk per sentence (small, clean docs). "
+             "recursive: LangChain RecursiveCharacterTextSplitter (larger PDFs).")
+    if chunk_mode == "recursive":
+        chunk_size = st.slider("Chunk size (characters)", 200, 2000, 1000, 100)
+        chunk_overlap = st.slider("Chunk overlap (characters)", 0, 400, 200, 20)
+    else:
+        chunk_size, chunk_overlap = 100, 20   # unused by sentence mode
+
+    # Retrieval controls
     st.header("Retrieval")
     top_k = st.slider("top-k", 1, 10, 5)
 
-    # --- Thresholds for the refuse / clarify logic ---
+    # Thresholds for the refuse / clarify logic
     st.header("Confidence gate")
     refuse_below = st.slider("Refuse below (cosine)", 0.0, 0.9, 0.35, 0.01)
     clarify_margin = st.slider("Clarify if margin below", 0.0, 0.3, 0.05, 0.01)
@@ -93,13 +96,15 @@ if not pdf_dir:
         st.stop()
 
 try:
-    index = build(pdf_dir, st.session_state.get("stamp", "bundled"))
+    index = build(pdf_dir, st.session_state.get("stamp", "bundled"),
+                  chunk_mode, chunk_size, chunk_overlap)
 except Exception as exc:
     st.error(f"Could not build the index: {exc}")
     st.stop()
 
-# Fixed pipeline config, plus the live retrieval/gate sliders for this query.
-cfg = rc.Config(embedder="openai", chunk_mode="sentence", title_prefix=True,
+# Pipeline config, plus the live retrieval/gate sliders for this query.
+cfg = rc.Config(embedder="openai", chunk_mode=chunk_mode, title_prefix=True,
+                chunk_size=chunk_size, chunk_overlap=chunk_overlap,
                 mode="hybrid", dense_weight=0.6, top_k=top_k,
                 refuse_below=refuse_below, clarify_margin=clarify_margin)
 

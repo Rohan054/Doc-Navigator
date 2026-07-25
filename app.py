@@ -1,9 +1,10 @@
-"""Document Navigator - Streamlit demo.
+"""Document Navigator - Streamlit demo (OpenAI-powered).
 
+Needs an OpenAI API key (OPENAI_API_KEY) for both embeddings and answers.
 Deploy: push app.py + rag_core.py + requirements.txt (+ optional pdfs/) to GitHub,
-then share.streamlit.io -> New app -> main file app.py.
+then share.streamlit.io -> New app -> main file app.py -> Secrets: OPENAI_API_KEY.
 """
-import shutil, tempfile
+import os, shutil, tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -21,18 +22,38 @@ BADGE = {"answer":  ("Answered", "#1a7f37", "Evidence cleared the confidence thr
 PDF_DIR = Path("pdfs")
 
 
-# Fixed pipeline: MiniLM embeddings, sentence chunking, title prefix, hybrid retrieval.
+def get_api_key():
+    """Prefer Streamlit Secrets, fall back to the environment variable."""
+    try: return st.secrets["OPENAI_API_KEY"]
+    except Exception: return os.getenv("OPENAI_API_KEY")
+
+
+# Key required: OpenAI powers both embeddings and answers. Publish it to the env
+# so rag_core's OpenAI client picks it up everywhere.
+API_KEY = get_api_key()
+if API_KEY:
+    os.environ["OPENAI_API_KEY"] = API_KEY
+
+
+# Fixed pipeline: OpenAI text-embedding-3-small, sentence chunking, title prefix, hybrid.
 # Cache the built index; the `stamp` arg is part of the cache key, so changing PDFs
 # forces a rebuild.
-@st.cache_resource(show_spinner="Building index...")
+@st.cache_resource(show_spinner="Building index (embedding with OpenAI)...")
 def build(pdf_dir: str, stamp: str):
-    cfg = rc.Config(embedder="minilm", chunk_mode="sentence", title_prefix=True)
+    cfg = rc.Config(embedder="openai", chunk_mode="sentence", title_prefix=True)
     return rc.build_index(cfg, pdf_dir)
 
 
 st.title("Document Navigator")
 st.caption("A RAG assistant that shows *why* it answered: retrieval traces, citations, "
-           "and an explicit confidence gate.")
+           "and an explicit confidence gate. Powered by OpenAI.")
+
+# OpenAI key is mandatory (embeddings + answers). Stop early with a clear message.
+if not API_KEY:
+    st.error("This app needs an OpenAI API key. Add **OPENAI_API_KEY** in "
+             "Streamlit **Settings → Secrets** (or set it as an environment variable "
+             "when running locally), then reload.")
+    st.stop()
 
 with st.sidebar:
     # --- Document source: upload PDFs, or use any bundled in pdfs/ ---
@@ -78,7 +99,7 @@ except Exception as exc:
     st.stop()
 
 # Fixed pipeline config, plus the live retrieval/gate sliders for this query.
-cfg = rc.Config(embedder="minilm", chunk_mode="sentence", title_prefix=True,
+cfg = rc.Config(embedder="openai", chunk_mode="sentence", title_prefix=True,
                 mode="hybrid", dense_weight=0.6, top_k=top_k,
                 refuse_below=refuse_below, clarify_margin=clarify_margin)
 

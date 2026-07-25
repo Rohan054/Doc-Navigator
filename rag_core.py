@@ -1,11 +1,4 @@
-"""Document Navigator - transparent RAG core (single module).
 
-Pipeline: PDFs -> clean -> chunk -> embed -> FAISS + BM25 -> hybrid fuse
-          -> retrieval trace -> confidence gate -> cited extractive answer.
-
-Written to disk by the notebook (%%writefile) and imported by both the notebook
-and app.py, so there is exactly one copy of the pipeline.
-"""
 from __future__ import annotations
 
 import os, re, csv, json, pickle, unicodedata
@@ -15,21 +8,21 @@ from typing import Any, Literal
 
 import numpy as np
 
-# Identical disclaimer line in every sample PDF -> pure index noise, dropped at chunk time.
+# Identical disclaimer line in every sample PDF - pure index noise, dropped at chunk time.
 BOILERPLATE = re.compile(r"this pdf is synthetic and intended for", re.I)
 NUMBERED = re.compile(r"^\s*\d+[.)]\s+")   # "1. " / "2) " list markers (fixed/legacy use)
 SENTENCE = re.compile(r"(?<=[.!?])\s+")    # split after . ! ? followed by whitespace
 TOKEN = re.compile(r"[a-z0-9]+")           # BM25 tokenizer pattern
 
 
-# ───────────────────────── config ─────────────────────────
+# config
 @dataclass
 class Config:
     """Every tunable in one place. Copy + tweak fields to run an experiment."""
     name: str = "default"
-    chunk_mode: str = "sentence"      # sentence | fixed | whole
-    chunk_size: int = 100             # words per chunk (fixed mode only)
-    chunk_overlap: int = 20           # word overlap between chunks (fixed mode only)
+    chunk_mode: str = "sentence"      # sentence | recursive | fixed | whole
+    chunk_size: int = 100             # target size: words (fixed) or characters (recursive)
+    chunk_overlap: int = 20           # overlap: words (fixed) or characters (recursive)
     title_prefix: bool = True         # prepend doc title to each chunk's embedded text
     drop_boilerplate: bool = True     # remove the repeated disclaimer line
     embedder: str = "openai"          # openai | minilm | tfidf | tfidf_char
@@ -44,7 +37,7 @@ class Config:
     def to_dict(self) -> dict: return asdict(self)
 
 
-# ───────────────────────── ingest ─────────────────────────
+# ingest 
 @dataclass
 class Page:
     """One PDF page. source + page drive the [file:page] citation."""
@@ -87,7 +80,7 @@ def corpus_stats(pages: list[Page]) -> dict:
             "words": w, "avg_words_per_page": round(w / max(len(pages), 1), 1)}
 
 
-# ───────────────────────── chunking ─────────────────────────
+# chunking
 @dataclass
 class Chunk:
     """A retrievable unit. `text` is shown to the user; `embed_text` is what gets
@@ -124,6 +117,18 @@ def _segments(pg: Page, cfg: Config) -> list[str]:
             else: out += [" ".join(w[i:i + 180]) for i in range(0, len(w), 150)]  # 30-word overlap
         return out
 
+    if cfg.chunk_mode == "recursive":     # LangChain RecursiveCharacterTextSplitter
+        # Best for larger, prose-heavy PDFs: splits on paragraph -> line -> sentence
+        # -> word boundaries to hit ~chunk_size CHARACTERS with chunk_overlap overlap,
+        # trying not to cut mid-sentence. chunk_size/overlap are characters here.
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        body = [l for l in lines if l != pg.title]        # drop the title line
+        text = "\n".join(body)
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=cfg.chunk_size, chunk_overlap=cfg.chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""])
+        return [s.strip() for s in splitter.split_text(text) if len(s.split()) >= 3]
+
     raise ValueError(f"Unknown chunk_mode: {cfg.chunk_mode}")
 
 
@@ -140,7 +145,7 @@ def chunk_pages(pages: list[Page], cfg: Config) -> list[Chunk]:
     return chunks
 
 
-# ───────────────────────── embedding ─────────────────────────
+# embedding 
 def _norm(v) -> np.ndarray:
     """L2-normalise rows so FAISS inner product == cosine similarity."""
     v = np.asarray(v, dtype="float32")
@@ -240,7 +245,7 @@ def get_embedder(name: str, embed_model: str = "text-embedding-3-small", api_key
     raise ValueError(name)
 
 
-# ───────────────────────── index ─────────────────────────
+# index 
 def tokenize(t: str) -> list[str]: return TOKEN.findall(t.lower())   # shared by BM25 build + query
 
 
@@ -291,7 +296,7 @@ def build_index(cfg: Config | None = None, pdf_dir="pdfs", api_key: str | None =
     return Index(cfg, chunks, fi, BM25Okapi([tokenize(t) for t in corpus]), emb)
 
 
-# ───────────────────────── retrieval + trace ─────────────────────────
+# retrieval + trace
 @dataclass
 class Hit:
     """One retrieved chunk with its scores — the row-level unit of a trace."""
@@ -371,7 +376,7 @@ def search(index: Index, query: str, top_k=None, mode=None, dense_weight=None) -
     return Trace(query, mode, top_k, hits, {"dense_weight": w, "n_chunks": n})
 
 
-# ───────────────────────── answering ─────────────────────────
+# answering
 Decision = Literal["answer", "clarify", "refuse"]
 REFUSAL = ("I don't have enough evidence in these documents to answer that. "
            "The closest material found is shown in the trace below.")

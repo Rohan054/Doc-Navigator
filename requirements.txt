@@ -4,5 +4,6 @@ pandas>=2.2,<4
 scikit-learn>=1.4,<2
 faiss-cpu>=1.8,<2
 rank-bm25==0.2.2
+langchain-text-splitters>=0.2,<1
 openai>=1.40,<3
 streamlit>=1.36,<2
